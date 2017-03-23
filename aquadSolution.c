@@ -1,9 +1,11 @@
+/**
+ * Adaptive quadrature with MPI.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <mpi.h>
 #include <unistd.h>
-#include <stdbool.h>
 #include "stack.h"
 #define EPSILON 1e-3
 #define F(arg)  cosh(arg)*cosh(arg)*cosh(arg)*cosh(arg)
@@ -15,8 +17,9 @@
 #define RESULT_TAG 404
 #define DONE_TAG 1337
 
+#define FALSE 0
+#define TRUE 1
 #define SLEEPTIME 1
-
 #define FARMER 0
 
 int *tasks_per_process;
@@ -83,46 +86,53 @@ double farmer(int numprocs) {
     double recv_data[2];
     int worker;
     int n_workers = numprocs - 1;
-    bool* idle_list = (bool*) malloc(sizeof(bool)*n_workers);
-    for (int i = 0; i < n_workers; i++) {
-        idle_list[i] = 0;
+    // char to occupy less storage than int
+    char * idle_list = (char *) malloc(sizeof(char)*n_workers);
+    for (worker = 0; worker < n_workers; worker++) {
+        // set all workers to busy
+        idle_list[worker] = FALSE;
     }
     int n_idle = 0;
-    int j = 0;
-    stack* stack = new_stack();
-    // push the initial data to the stack
+    stack* bag = new_stack();
+    // push the initial data to the bag
     recv_data[0] = A;
     recv_data[1] = B;
-    push(recv_data, stack);
-
-    while(!is_empty(stack) || n_idle < n_workers) {
+    push(recv_data, bag);
+    // the loop will continue to run as long as there are some tasks in the bag
+    while(!is_empty(bag) || n_idle < n_workers) {
+        // receive any message, it can be a task or a result
         MPI_Recv(recv_data, 2, MPI_DOUBLE, MPI_ANY_SOURCE,
                  MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
         if (status.MPI_TAG == TASK_TAG) {
-            push(recv_data, stack);
+            push(recv_data, bag);
             // and get another task as well
             MPI_Recv(recv_data, 2, MPI_DOUBLE, status.MPI_SOURCE,
                      TASK_TAG, MPI_COMM_WORLD, &status);
-            push(recv_data, stack);
+            push(recv_data, bag);
         } else if (status.MPI_TAG == RESULT_TAG) {
             result += recv_data[0];
         }
+        // the sending worker is now known to be idle
         idle_list[status.MPI_SOURCE-1] = 1;
         n_idle++;
-        // find idle workers and give them a task.
-        for (int j = 0; j < n_workers && !is_empty(stack) && n_idle > 0; ++j) {
-            if (idle_list[j]) {
-                send_data = pop(stack);
-                MPI_Send(send_data, 2, MPI_DOUBLE, j+1, TASK_TAG, MPI_COMM_WORLD);
+        // find all idle workers and give them a task
+        for (worker = 0; worker < n_workers && !is_empty(bag) && n_idle > 0; ++worker) {
+            if (idle_list[worker]) {
+                send_data = pop(bag);
+                // worker i has process id i+1
+                send_task(worker+1, send_data);
                 free(send_data);
-                idle_list[j] = false;
+                idle_list[worker] = FALSE;
                 n_idle--;
-                tasks_per_process[j+1]++;
+                tasks_per_process[worker+1]++;
             }
         }
     }
 
     for (int i = 1; i < numprocs; ++i) {
+        // send an empty message to all workers with a DONE_TAG to indicate that
+        // computation has finished
         MPI_Send(recv_data, 0, MPI_DOUBLE, i, DONE_TAG, MPI_COMM_WORLD);
     }
     free(idle_list);
@@ -178,14 +188,18 @@ void worker(int mypid) {
 }
 
 /**
- * Send a task to a given worker
- * @param worker ID of the worker to receive the task
+ * Send an adaptive quadrature task to a given process
+ * @param process ID of the worker to receive the task
  * @param data array of 2 doubles [left, right] for adaptive quadrature
  */
-void send_task(int worker, double* data) {
-    MPI_Send(data, 2, MPI_DOUBLE, worker, TASK_TAG, MPI_COMM_WORLD);
+void send_task(int process, double* data) {
+    MPI_Send(data, 2, MPI_DOUBLE, process, TASK_TAG, MPI_COMM_WORLD);
 }
 
+/**
+ * Receive an adaptive quadrature task from any process.
+ * @param recv_data Pointer to an array where the task data is stored
+ */
 void recv_task(double* recv_data) {
     MPI_Recv(recv_data, 2, MPI_DOUBLE, MPI_ANY_SOURCE, TASK_TAG, MPI_COMM_WORLD,
              MPI_STATUS_IGNORE);
