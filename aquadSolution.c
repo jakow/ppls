@@ -1,5 +1,60 @@
 /**
- * Adaptive quadrature with MPI.
+ * Adaptive quadrature with Bag of Tasks on MPI.
+ *
+ * Principles of operation:
+ * The BoT farmer creates a task bag using a stack data structure, to make the
+ * the order of execution roughly equivalent to those of recursive calls.
+ * As described by the problem, the farmer maintains a bag with tasks that are
+ * assigned to workers as they become available.
+ *
+ *
+ * The workers:
+ * When a worker is spawned, it sends a 0 result (line 162) to the farmer.
+ * This is effectively a handshake that says "I'm available". This removes
+ * the need to add code that handles the state of each worker at startup.
+ * Instead, sending the zero result does nothing to the final result but the
+ * farmer then knows that there is a worker with a given ID that is available.
+ * Thus the same code can be reused later on, when the workers return with real
+ * results.
+ *
+ * The worker uses a synchronous MPI_Recv, which blocks until a message
+ * is received. This is because the worker cannot continue if it has not
+ * received any new data.
+ * The worker sends new tasks and results to the farmer using the standard,
+ * blocking MPI_Send. If the message buffer is full, the worker must wait. This
+ * is important because the worker sends and receives using the same buffer, and
+ * the buffer should not be modified before a message is enqueued.
+ * If an immediate mode send was used, and the message buffer is full,
+ * then there is a chance that a new incoming task would override the data
+ * buffer before the message is send.
+ *
+ * The farmer:
+ * The farmer keeps track of the state of the workers in an array
+ * (idle_list[n_workers]). At the start of execution, all workers are considered
+ * busy. Then the farmer enters a loop, whose condition is that there are some
+ * busy workers and/or some tasks left in the bag. The loop thus only terminates
+ * when all tasks have finished.
+ *
+ * On entering the loop may only proceed if a message is received.
+ * Thus a standard mode synchronous receive MPI_Recv is used, which
+ * blocks until a message is received. The loop starts by receiving a message
+ * using wildcards from ANY_SOURCE and with ANY_TAG.
+ * Receiving a TASK_TAGged message means that there is one more task in
+ * the queue. They are both placed in the bag of tasks. If a message is
+ * RESULT_TAGged, it is accumulated by the farmer.
+ *
+ * Subsequently, the farmer assigns new tasks as long as there are tasks present
+ * and there are idle workers which can accept them.
+ *
+ * Compile with:
+ * mpicc = /usr/lib64/openmpi/bin/mpicc
+ * mpirun = /usr/lib64/openmpi/bin/mpirun
+ * mpicc -o stack.o -c stack.c
+ * mpicc -o aquadSolution.o -c aquadSolution.c
+ * mpicc aquadSolution.o stack.o -o aquadSolution -lm
+ * Run with:
+ * mpirun -c NPROC aquadSolution
+ * Where NPROC is the number of parallel processes to run
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,10 +83,23 @@ double farmer(int);
 
 void worker(int);
 
+/**
+ * Send an adaptive quadrature task to a given process. Uses blocking MPI_Send
+ * @param process ID of the worker to receive the task
+ * @param data array of 2 doubles [left, right] for adaptive quadrature
+ */
 void send_task(int, double*);
 
+/**
+ * Receive an adaptive quadrature task from any process.
+ * @param recv_data Pointer to an array where the task data is stored
+ */
 void recv_task(double* recv_data);
 
+/**
+ * Send the result of adaptive quadrature computation to the farmer.
+ * @param data Buffer with one double value
+ */
 void send_result(double* data) ;
 
 int main(int argc, char **argv ) {
@@ -86,7 +154,8 @@ double farmer(int numprocs) {
     double recv_data[2];
     int worker;
     int n_workers = numprocs - 1;
-    // char to occupy less storage than int
+    // Idle list of booleans. Char to occupy less storage than int.
+    // If C99 used, that would be simply a bool array
     char * idle_list = (char *) malloc(sizeof(char)*n_workers);
     for (worker = 0; worker < n_workers; worker++) {
         // set all workers to busy
@@ -144,8 +213,7 @@ void worker(int mypid) {
     double data[2] = {0, 0};
     double left, right, mid, fmid, fleft, fright, larea, rarea, lrarea;
     double result = 0;
-    // start by saying hi to the farmer
-
+    // start by saying hi to the farmer by sending an empty result
     send_result(&result);
     while(1) {
         // try and get a message from the farmer
@@ -175,6 +243,7 @@ void worker(int mypid) {
             // add two new task to the bag
             data[0] = left;
             data[1] = mid;
+//            send_task(FARMER, data);
             send_task(FARMER, data);
             data[0] = mid;
             data[1] = right;
@@ -186,24 +255,18 @@ void worker(int mypid) {
              MPI_STATUS_IGNORE);
 }
 
-/**
- * Send an adaptive quadrature task to a given process
- * @param process ID of the worker to receive the task
- * @param data array of 2 doubles [left, right] for adaptive quadrature
- */
+
 void send_task(int process, double* data) {
     MPI_Send(data, 2, MPI_DOUBLE, process, TASK_TAG, MPI_COMM_WORLD);
 }
 
-/**
- * Receive an adaptive quadrature task from any process.
- * @param recv_data Pointer to an array where the task data is stored
- */
+
 void recv_task(double* recv_data) {
     MPI_Recv(recv_data, 2, MPI_DOUBLE, MPI_ANY_SOURCE, TASK_TAG, MPI_COMM_WORLD,
              MPI_STATUS_IGNORE);
 
 }
+
 
 void send_result(double* data) {
     MPI_Send(data, 1, MPI_DOUBLE, FARMER, RESULT_TAG, MPI_COMM_WORLD);
