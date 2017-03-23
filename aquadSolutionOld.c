@@ -4,6 +4,7 @@
 #include <mpi.h>
 #include <unistd.h>
 #include "stack.h"
+
 #define EPSILON 1e-3
 #define F(arg)  cosh(arg)*cosh(arg)*cosh(arg)*cosh(arg)
 #define A 0.0
@@ -13,6 +14,7 @@
 #define TASK_TAG 42
 #define RESULT_TAG 404
 #define DONE_TAG 1337
+#define READY_TAG 80085
 
 #define SLEEPTIME 1
 
@@ -26,9 +28,11 @@ void worker(int);
 
 void send_task(int, double*);
 
+void ack_ready(int);
+
 void recv_task(double* recv_data);
 
-void send_result(double* data) ;
+void send_result(double* data);
 
 int main(int argc, char **argv ) {
     int i, myid, numprocs;
@@ -77,46 +81,57 @@ int main(int argc, char **argv ) {
 double farmer(int numprocs) {
     /* Setup */
     MPI_Status status;
-    double result = 0;
+    double area = 0;
     double* send_data;
     double recv_data[2];
-    int worker;
-    int n_workers = numprocs - 1;
-    int* idle_list = (int*) malloc(sizeof(int)*n_workers);
-    for (int i = 0; i < n_workers; i++) {
-        idle_list[i] = 0;
-    }
-    int n_idle = 0;
-    int j = 0;
+    int worker, ready, tag;
+    unsigned int tasks_created, tasks_dealt, result_count;
     stack* stack = new_stack();
     // push the initial data to the stack
     recv_data[0] = A;
     recv_data[1] = B;
     push(recv_data, stack);
-
-    while(!is_empty(stack) || n_idle < n_workers) {
-        MPI_Recv(recv_data, 2, MPI_DOUBLE, MPI_ANY_SOURCE,
-                 MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-        if (status.MPI_TAG == TASK_TAG) {
+    tasks_created = 1;
+    result_count = 0;
+    while(tasks_created > result_count * 2) {
+        // immediate probe for new tasks and enqueue them. Ready flag will be
+        // true if there is some tag to accumulate
+        MPI_Iprobe(MPI_ANY_SOURCE, TASK_TAG, MPI_COMM_WORLD, &ready, &status);
+        if (ready) {
+            recv_task(recv_data);
             push(recv_data, stack);
-            // and get another task as well
-            MPI_Recv(recv_data, 2, MPI_DOUBLE, status.MPI_SOURCE,
-                     TASK_TAG, MPI_COMM_WORLD, &status);
+            recv_task(recv_data);
             push(recv_data, stack);
-        } else if (status.MPI_TAG == RESULT_TAG) {
-            result += recv_data[0];
+            tasks_created += 2;
         }
-        idle_list[status.MPI_SOURCE-1] = 1;
-        n_idle++;
-        // find idle workers and give them a task.
-        for (int j = 0; j < n_workers && !is_empty(stack) && n_idle > 0; ++j) {
-            if (idle_list[j]) {
+        // immediate probe for result and accumulate it
+        MPI_Iprobe(MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &ready, &status);
+        if (ready) {
+            worker = status.MPI_SOURCE;
+            MPI_Recv(recv_data, 1, MPI_DOUBLE, worker, RESULT_TAG,
+                     MPI_COMM_WORLD, &status);
+            area += recv_data[0];
+            result_count++;
+
+        }
+        // now assign tasks to idle workers
+        int count = 0;
+        while(!is_empty(stack)) {
+            MPI_Iprobe(MPI_ANY_SOURCE, READY_TAG, MPI_COMM_WORLD, &ready,
+                       &status);
+            if (ready) {
+                worker = status.MPI_SOURCE;
+                // acknowledge the message
+                ack_ready(worker);
+                // and send a new task to the acknowledged worker
                 send_data = pop(stack);
-                MPI_Send(send_data, 2, MPI_DOUBLE, j+1, TASK_TAG, MPI_COMM_WORLD);
+                send_task(worker, send_data);
+                tasks_per_process[worker]++;
                 free(send_data);
-                idle_list[j] = 0;
-                n_idle--;
-                tasks_per_process[j+1]++;
+                count++;
+            } else {
+                // otherwise keep the worker in the queue
+                break;
             }
         }
     }
@@ -124,19 +139,17 @@ double farmer(int numprocs) {
     for (int i = 1; i < numprocs; ++i) {
         MPI_Send(recv_data, 0, MPI_DOUBLE, i, DONE_TAG, MPI_COMM_WORLD);
     }
-    free(idle_list);
-    return result;
+    return area;
 }
 
 void worker(int mypid) {
     // local data
     MPI_Status status;
-    double data[2] = {0, 0};
+    double data[2];
     double left, right, mid, fmid, fleft, fright, larea, rarea, lrarea;
     double result = 0;
     // start by saying hi to the farmer
-
-    send_result(&result);
+    MPI_Send(&mypid, 1, MPI_INT, FARMER, READY_TAG, MPI_COMM_WORLD);
     while(1) {
         // try and get a message from the farmer
         MPI_Probe(FARMER, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
@@ -144,7 +157,8 @@ void worker(int mypid) {
             break;
         }
         // otherwise a task tag
-        recv_task(data);
+        MPI_Recv(data, 2, MPI_DOUBLE, FARMER, TASK_TAG,
+                 MPI_COMM_WORLD, &status);
         // compute the area approximations using adaptive quadrature
         left = data[0];
         right = data[1];
@@ -170,8 +184,9 @@ void worker(int mypid) {
             data[1] = right;
             send_task(FARMER, data);
         }
+        MPI_Send(&mypid, 1, MPI_INT, FARMER, READY_TAG, MPI_COMM_WORLD);
     }
-    // acknowledge done and quit
+    // acknowledge done
     MPI_Recv(data, 0, MPI_DOUBLE, FARMER, DONE_TAG, MPI_COMM_WORLD,
              MPI_STATUS_IGNORE);
 }
@@ -185,12 +200,22 @@ void send_task(int worker, double* data) {
     MPI_Send(data, 2, MPI_DOUBLE, worker, TASK_TAG, MPI_COMM_WORLD);
 }
 
+void send_result(double* data) {
+    MPI_Send(data, 1, MPI_DOUBLE, FARMER, RESULT_TAG, MPI_COMM_WORLD);
+}
+/**
+ *
+ * @param worker
+ */
+
+void ack_ready(int worker) {
+    int dummy;
+    MPI_Recv(&dummy, 1, MPI_INT, worker, READY_TAG, MPI_COMM_WORLD,
+             MPI_STATUS_IGNORE);
+}
+
 void recv_task(double* recv_data) {
     MPI_Recv(recv_data, 2, MPI_DOUBLE, MPI_ANY_SOURCE, TASK_TAG, MPI_COMM_WORLD,
              MPI_STATUS_IGNORE);
 
-}
-
-void send_result(double* data) {
-    MPI_Send(data, 1, MPI_DOUBLE, FARMER, RESULT_TAG, MPI_COMM_WORLD);
 }
