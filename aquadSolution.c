@@ -129,11 +129,10 @@ double farmer(int numprocs) {
             }
         }
     }
-
-    for (int i = 1; i < numprocs; ++i) {
+    for (worker = 1; worker < numprocs; ++worker) {
         // send an empty message to all workers with a DONE_TAG to indicate that
         // computation has finished
-        MPI_Send(recv_data, 0, MPI_DOUBLE, i, DONE_TAG, MPI_COMM_WORLD);
+        MPI_Send(recv_data, 0, MPI_DOUBLE, worker, DONE_TAG, MPI_COMM_WORLD);
     }
     free(idle_list);
     return result;
