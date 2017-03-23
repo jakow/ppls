@@ -3,6 +3,7 @@
 #include <math.h>
 #include <mpi.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include "stack.h"
 #define EPSILON 1e-3
 #define F(arg)  cosh(arg)*cosh(arg)*cosh(arg)*cosh(arg)
@@ -82,7 +83,7 @@ double farmer(int numprocs) {
     double recv_data[2];
     int worker;
     int n_workers = numprocs - 1;
-    int* idle_list = (int*) malloc(sizeof(int)*n_workers);
+    bool* idle_list = (bool*) malloc(sizeof(bool)*n_workers);
     for (int i = 0; i < n_workers; i++) {
         idle_list[i] = 0;
     }
@@ -114,7 +115,7 @@ double farmer(int numprocs) {
                 send_data = pop(stack);
                 MPI_Send(send_data, 2, MPI_DOUBLE, j+1, TASK_TAG, MPI_COMM_WORLD);
                 free(send_data);
-                idle_list[j] = 0;
+                idle_list[j] = false;
                 n_idle--;
                 tasks_per_process[j+1]++;
             }
